@@ -1,0 +1,37 @@
+# Python/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+
+# Experiment trackers and logs
+wandb/
+runs/
+logs/
+*.log
+*.out
+*.err
+
+# Generated model/data artifacts
+data/post_training_dataset/
+data/sft_tokenized/
+fineweb_pit/
+model-sft/
+ifeval_outputs/
+results/plots/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.pkl
+*.npy
+*.npz
