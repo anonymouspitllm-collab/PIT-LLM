@@ -18,15 +18,14 @@ from models.GPT import GPT
 from models.GPTConfig import GPT2_4B
 
 DATASET_DIR       = "/scratch/$USER/dataset/jkp_matched"
-CKPT_DIR          = "/scratch/$USER/checkpoints/4B"
-CKPT_DIR_FULL     = "/scratch/$USER/checkpoints/4B-full"
-OUTPUT_DIR        = "/scratch/$USER/embeddings/4b-v2"
-OUTPUT_DIR_FULL   = "/scratch/$USER/embeddings/4b-full"
+CKPT_DIR          = "/scratch/$USER/checkpoints/4B-FT"
+CKPT_DIR_FULL     = "/scratch/$USER/checkpoints/4B-FT-full"
+OUTPUT_DIR        = "/scratch/$USER/embeddings/4b-ft-v2"
+OUTPUT_DIR_FULL   = "/scratch/$USER/embeddings/4b-ft-full"
 MAX_TOKENS        = 2048
 BATCH_SIZE        = 64
 
 # Available checkpoints sorted chronologically as (year, month) tuples.
-# Add or remove entries here if checkpoints are added later.
 CHECKPOINTS: list[tuple[int, int]] = [
     (2013, 12),
     (2014, 12),
@@ -35,12 +34,11 @@ CHECKPOINTS: list[tuple[int, int]] = [
     (2017, 12),
     (2018, 12),
     (2019, 12),
-    (2020, 12),
 ]
 
 
 def ckpt_stem(year: int, month: int) -> str:
-    return f"{year}-{month:02d}_checkpoint.pt"
+    return f"{year}-{month:02d}_merged.pt"
 
 
 def get_checkpoint_ym(file_year: int, file_month: int) -> tuple[int, int]:
@@ -48,13 +46,6 @@ def get_checkpoint_ym(file_year: int, file_month: int) -> tuple[int, int]:
 
     Uses the most recent checkpoint strictly before (file_year, file_month),
     floored at the earliest available checkpoint (2013-12).
-
-    Examples
-    --------
-    - 2014-01 .. 2014-12  →  2013-12  (only checkpoint before 2014)
-    - 2015-01 .. 2015-11  →  2014-12
-    - 2015-12 .. 2016-12  →  2015-11  (no 2015-12 checkpoint exists)
-    - 2017-01 .. 2017-12  →  2016-12
     """
     file_ym = (file_year, file_month)
     best = CHECKPOINTS[0]           # floor: use earliest if nothing is strictly before
@@ -64,8 +55,8 @@ def get_checkpoint_ym(file_year: int, file_month: int) -> tuple[int, int]:
     return best
 
 
-def load_4b_model(ckpt_year: int, ckpt_month: int, device: torch.device,
-                  ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> GPT:
+def load_4b_ft_model(ckpt_year: int, ckpt_month: int, device: torch.device,
+                     ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> GPT:
     if last_ckpt:
         pts = glob.glob(os.path.join(ckpt_dir, "*.pt"))
         if len(pts) != 1:
@@ -99,9 +90,9 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
     after the last transformer block, identical to what lm_head projects.
 
     Args:
-        padding: "left" (default) pads on the left so the last real token is
-                 always at position -1.  "right" pads on the right and uses
-                 each article's true token length to index the last real token.
+        padding: "left" pads on the left so the last real token is always at
+                 position -1.  "right" pads on the right and uses each
+                 article's true token length to index the last real token.
     """
     captured: dict = {}
 
@@ -156,6 +147,7 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
     for sorted_pos, orig_pos in enumerate(sorted_indices):
         result[orig_pos] = sorted_embs[sorted_pos]
     return np.vstack(result)
+
 
 def build_work_list(out_dir: Path, last_ckpt: bool = False) -> List[Tuple[Optional[Tuple[int, int]], str]]:
     """Return sorted list of ((ckpt_year, ckpt_month), fpath) for unprocessed files.
@@ -245,7 +237,7 @@ def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
                     print(f"\n=== {prefix} Full checkpoint (last_ckpt) ===", flush=True)
                 else:
                     print(f"\n=== {prefix} Checkpoint {ckpt_ym[0]}-{ckpt_ym[1]:02d} ===", flush=True)
-                model = load_4b_model(
+                model = load_4b_ft_model(
                     *(ckpt_ym if ckpt_ym else (None, None)), device,
                     ckpt_dir=ckpt_dir, last_ckpt=last_ckpt,
                 )
@@ -278,7 +270,7 @@ def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
 
 def test_mode(padding: str = "right", seed: int = None,
               ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> None:
-    """Embed 3 randomly sampled articles and print sanity checks."""
+    """Embed one article from each of 3 different date-spread files and print sanity checks."""
     rng = np.random.default_rng(seed)
 
     all_files = sorted(glob.glob(os.path.join(DATASET_DIR, "DJN_*_retmatched.pkl")))
@@ -286,41 +278,64 @@ def test_mode(padding: str = "right", seed: int = None,
         print("No dataset files found — check DATASET_DIR.")
         return
 
-    fpath = all_files[rng.integers(len(all_files))]
-    fname = Path(fpath).name
-    date_part = fname.split("_")[1]
-    file_year, file_month = int(date_part.split("-")[0]), int(date_part.split("-")[1])
-    ckpt_ym = None if last_ckpt else get_checkpoint_ym(file_year, file_month)
-
-    print(f"=== TEST MODE ===")
-    print(f"File       : {fname}")
-    if last_ckpt:
-        print(f"Checkpoint : (last_ckpt) {ckpt_dir}")
-    else:
-        print(f"Checkpoint : {ckpt_ym[0]}-{ckpt_ym[1]:02d}")
+    # Pick 3 files spread evenly across the date range
+    n = len(all_files)
+    bucket_size = n // 3
+    chosen_files = [
+        all_files[rng.integers(i * bucket_size, (i + 1) * bucket_size)]
+        for i in range(3)
+    ]
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"Device     : {device}")
-
     tokenizer = tiktoken.get_encoding("gpt2")
-    model = load_4b_model(
-        *(ckpt_ym if ckpt_ym else (None, None)), device,
-        ckpt_dir=ckpt_dir, last_ckpt=last_ckpt,
-    )
 
-    with open(fpath, "rb") as f:
-        df = pickle.load(f)
-
-    all_articles = df["Article"].fillna("").tolist()
-    indices = rng.choice(len(all_articles), size=min(3, len(all_articles)), replace=False)
-    articles = [all_articles[i] for i in sorted(indices)]
-    token_lens = [len(tokenizer.encode(a)) for a in articles]
-    print(f"Articles   : {len(articles)} (indices {list(sorted(indices))},"
-          f" token lengths {token_lens}, truncated to {MAX_TOKENS})")
+    print(f"=== TEST MODE ===")
+    print(f"Device     : {device}")
     print(f"Padding    : {padding}")
+    print(f"Last ckpt  : {last_ckpt}")
+    print()
 
-    embs = embed_articles(model, tokenizer, articles, device, padding=padding)
+    articles = []
+    labels = []
+    current_model = None
+    current_ckpt = "unloaded"
 
+    for fpath in chosen_files:
+        fname = Path(fpath).name
+        date_part = fname.split("_")[1]
+        file_year, file_month = int(date_part.split("-")[0]), int(date_part.split("-")[1])
+        ckpt_ym = None if last_ckpt else get_checkpoint_ym(file_year, file_month)
+
+        # Load model only if checkpoint changed
+        if ckpt_ym != current_ckpt:
+            if last_ckpt:
+                print(f"  Loading full checkpoint from {ckpt_dir} ...")
+            else:
+                print(f"  Loading checkpoint {ckpt_ym[0]}-{ckpt_ym[1]:02d} ...")
+            current_model = load_4b_ft_model(
+                *(ckpt_ym if ckpt_ym else (None, None)), device,
+                ckpt_dir=ckpt_dir, last_ckpt=last_ckpt,
+            )
+            current_ckpt = ckpt_ym
+
+        with open(fpath, "rb") as f:
+            df = pickle.load(f)
+
+        all_arts = df["Article"].fillna("").tolist()
+        # Prefer longer articles (top-25% by token length), pick one randomly
+        tok_lens = [len(tokenizer.encode(a)[:MAX_TOKENS]) for a in all_arts]
+        threshold = np.percentile(tok_lens, 75)
+        candidates = [i for i, l in enumerate(tok_lens) if l >= threshold]
+        idx = int(rng.choice(candidates))
+        article = all_arts[idx]
+        tok_len = tok_lens[idx]
+
+        emb = embed_articles(current_model, tokenizer, [article], device, padding=padding)
+        articles.append(emb[0])
+        labels.append((fname, idx, tok_len, ckpt_ym))
+        print(f"  [{fname}]  article {idx}, {tok_len} tokens, ckpt {ckpt_ym[0]}-{ckpt_ym[1]:02d}")
+
+    embs = np.vstack(articles)
     print(f"\nEmbedding shape : {embs.shape}")
     print(f"dtype           : {embs.dtype}")
     print(f"min / max       : {embs.min():.4f} / {embs.max():.4f}")
@@ -341,7 +356,7 @@ def test_mode(padding: str = "right", seed: int = None,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Embed financial articles with the 4B model.")
+    parser = argparse.ArgumentParser(description="Embed financial articles with the 4B-FT model.")
     parser.add_argument("--test", action="store_true", help="Run sanity check on one file and exit.")
     parser.add_argument("--padding", choices=["left", "right"], default="right",
                         help="Padding side: 'left' keeps last real token at position -1; "
@@ -349,8 +364,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for article selection in test mode.")
     parser.add_argument("--last_ckpt", action="store_true",
-                        help="Use the single final checkpoint from 4B-full instead of time-varying checkpoints. "
-                             "Saves results to the 4b-full output directory.")
+                        help="Use the single final checkpoint from 4B-FT-full instead of time-varying checkpoints. "
+                             "Saves results to the 4b-ft-full output directory.")
     args = parser.parse_args()
 
     ckpt_dir = CKPT_DIR_FULL if args.last_ckpt else CKPT_DIR
@@ -385,7 +400,6 @@ def main():
         worker(0, 1, work_list, out_dir, padding=args.padding, ckpt_dir=ckpt_dir, last_ckpt=args.last_ckpt)
 
     aggregate_embeddings(out_dir)
-    print("\nDone.")
 
 
 if __name__ == "__main__":

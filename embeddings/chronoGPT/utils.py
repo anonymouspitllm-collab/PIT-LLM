@@ -10,12 +10,12 @@ _AVAILABLE_YEARS = range(1999, 2025)
 # Model-type registry: maps model_type → (repo pattern, class filename, class name)
 _MODEL_REGISTRY = {
     "base": (
-        "anonymous-authors/chrono-gpt-v1-{year}1231",
+        "manelalab/chrono-gpt-v1-{year}1231",
         "ChronoGPT_inference.py",
         "ChronoGPT",
     ),
     "instruct": (
-        "anonymous-authors/chrono-gpt-instruct-v1-{year}1231",
+        "manelalab/chrono-gpt-instruct-v1-{year}1231",
         "ChronoGPT_instruct.py",
         "ChronoGPT",
     ),

@@ -22,7 +22,7 @@ if [ ! -d "$VENV" ]; then
     "$VENV/bin/pip" install torch tiktoken pandas huggingface_hub
 fi
 
-source "$VENV/bin/activate"
+export PATH="$VENV/bin:$PATH"
 
 SCRIPT_DIR=/home/$USER/repo/embeddings/chronoGPT
 cd "$SCRIPT_DIR"

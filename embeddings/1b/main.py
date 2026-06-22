@@ -1,6 +1,6 @@
 import argparse
-import os
 import glob
+import os
 import pickle
 import sys
 import torch
@@ -10,23 +10,19 @@ import pandas as pd
 import tiktoken
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Tuple, Optional
 
 # Make models/ importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from models.GPT import GPT
-from models.GPTConfig import GPT2_4B
+from models.GPTConfig import GPT2_1B
 
-DATASET_DIR       = "/scratch/$USER/dataset/jkp_matched"
-CKPT_DIR          = "/scratch/$USER/checkpoints/4B"
-CKPT_DIR_FULL     = "/scratch/$USER/checkpoints/4B-full"
-OUTPUT_DIR        = "/scratch/$USER/embeddings/4b-v2"
-OUTPUT_DIR_FULL   = "/scratch/$USER/embeddings/4b-full"
-MAX_TOKENS        = 2048
-BATCH_SIZE        = 64
+DATASET_DIR  = "/scratch/$USER/dataset/jkp_matched"
+CKPT_DIR     = "/scratch/$USER/checkpoints/1B"
+OUTPUT_DIR   = "/scratch/$USER/embeddings/1b-v2"
+MAX_TOKENS   = 2048
+BATCH_SIZE   = 256
 
 # Available checkpoints sorted chronologically as (year, month) tuples.
-# Add or remove entries here if checkpoints are added later.
 CHECKPOINTS: list[tuple[int, int]] = [
     (2013, 12),
     (2014, 12),
@@ -36,11 +32,15 @@ CHECKPOINTS: list[tuple[int, int]] = [
     (2018, 12),
     (2019, 12),
     (2020, 12),
+    (2021, 12),
+    (2022, 12),
+    (2023, 12),
+    (2024, 12),
 ]
 
 
 def ckpt_stem(year: int, month: int) -> str:
-    return f"{year}-{month:02d}_checkpoint.pt"
+    return f"{year}-{month:02d}.pt"
 
 
 def get_checkpoint_ym(file_year: int, file_month: int) -> tuple[int, int]:
@@ -48,36 +48,22 @@ def get_checkpoint_ym(file_year: int, file_month: int) -> tuple[int, int]:
 
     Uses the most recent checkpoint strictly before (file_year, file_month),
     floored at the earliest available checkpoint (2013-12).
-
-    Examples
-    --------
-    - 2014-01 .. 2014-12  →  2013-12  (only checkpoint before 2014)
-    - 2015-01 .. 2015-11  →  2014-12
-    - 2015-12 .. 2016-12  →  2015-11  (no 2015-12 checkpoint exists)
-    - 2017-01 .. 2017-12  →  2016-12
     """
     file_ym = (file_year, file_month)
-    best = CHECKPOINTS[0]           # floor: use earliest if nothing is strictly before
+    best = CHECKPOINTS[0]
     for ckpt_ym in CHECKPOINTS:
         if ckpt_ym < file_ym:
             best = ckpt_ym
     return best
 
 
-def load_4b_model(ckpt_year: int, ckpt_month: int, device: torch.device,
-                  ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> GPT:
-    if last_ckpt:
-        pts = glob.glob(os.path.join(ckpt_dir, "*.pt"))
-        if len(pts) != 1:
-            raise RuntimeError(f"Expected exactly one .pt file in {ckpt_dir}, found: {pts}")
-        path = pts[0]
-    else:
-        path = os.path.join(ckpt_dir, ckpt_stem(ckpt_year, ckpt_month))
-    print(f"  Loading checkpoint: {path}", flush=True)
+def load_1b_model(ckpt_year: int, ckpt_month: int, device: torch.device) -> GPT:
+    pt_path = os.path.join(CKPT_DIR, ckpt_stem(ckpt_year, ckpt_month))
+    print(f"  Loading checkpoint: {pt_path}", flush=True)
 
-    model = GPT(GPT2_4B())
+    model = GPT(GPT2_1B())
 
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(pt_path, map_location="cpu")
     raw_sd = ckpt["model"]
     new_sd = OrderedDict()
     for k, v in raw_sd.items():
@@ -157,21 +143,20 @@ def embed_articles(model, tokenizer, articles: list[str], device: torch.device, 
         result[orig_pos] = sorted_embs[sorted_pos]
     return np.vstack(result)
 
-def build_work_list(out_dir: Path, last_ckpt: bool = False) -> List[Tuple[Optional[Tuple[int, int]], str]]:
-    """Return sorted list of ((ckpt_year, ckpt_month), fpath) for unprocessed files.
 
-    When last_ckpt=True, ckpt_ym is None for every entry (single fixed checkpoint).
-    """
+def build_work_list(out_dir: Path) -> list[tuple[tuple[int, int], str]]:
+    """Return sorted list of ((ckpt_year, ckpt_month), fpath) for unprocessed files."""
     all_files = sorted(glob.glob(os.path.join(DATASET_DIR, "DJN_*_retmatched.pkl")))
     pairs = []
     for fpath in all_files:
         fname = Path(fpath).name      # DJN_YYYY-MM_retmatched.pkl
         date_part = fname.split("_")[1]
         file_year, file_month = int(date_part.split("-")[0]), int(date_part.split("-")[1])
-        ckpt_ym = None if last_ckpt else get_checkpoint_ym(file_year, file_month)
+        ckpt_ym = get_checkpoint_ym(file_year, file_month)
         out_path = out_dir / f"{Path(fpath).stem}_embeddings.pkl"
         if not out_path.exists():
             pairs.append((ckpt_ym, fpath))
+    # Sort by (ckpt_ym, fpath) so each GPU loads each checkpoint only once
     return sorted(pairs)
 
 
@@ -216,8 +201,7 @@ def aggregate_embeddings(out_dir: Path) -> None:
     print(f"Saved monthly embeddings ({len(monthly)} rows) → {out_path}")
 
 
-def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
-           padding: str = "right", ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> None:
+def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path, padding: str = "right") -> None:
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     prefix = f"[GPU {rank}]" if torch.cuda.is_available() else "[CPU]"
 
@@ -231,7 +215,7 @@ def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
 
     print(f"  {prefix} {len(chunk)} files to embed.", flush=True)
 
-    current_ckpt_ym = "unloaded"  # sentinel distinct from None (used by last_ckpt)
+    current_ckpt_ym = None
     model = None
     tokenizer = tiktoken.get_encoding("gpt2")
 
@@ -241,14 +225,8 @@ def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
                 if model is not None:
                     del model
                     torch.cuda.empty_cache()
-                if last_ckpt:
-                    print(f"\n=== {prefix} Full checkpoint (last_ckpt) ===", flush=True)
-                else:
-                    print(f"\n=== {prefix} Checkpoint {ckpt_ym[0]}-{ckpt_ym[1]:02d} ===", flush=True)
-                model = load_4b_model(
-                    *(ckpt_ym if ckpt_ym else (None, None)), device,
-                    ckpt_dir=ckpt_dir, last_ckpt=last_ckpt,
-                )
+                print(f"\n=== {prefix} Checkpoint {ckpt_ym[0]}-{ckpt_ym[1]:02d} ===", flush=True)
+                model = load_1b_model(*ckpt_ym, device)
                 current_ckpt_ym = ckpt_ym
 
             stem = Path(fpath).stem
@@ -276,8 +254,7 @@ def worker(rank: int, num_gpus: int, work_list: list, out_dir: Path,
             torch.cuda.empty_cache()
 
 
-def test_mode(padding: str = "right", seed: int = None,
-              ckpt_dir: str = CKPT_DIR, last_ckpt: bool = False) -> None:
+def test_mode(padding: str = "right", seed: int = None) -> None:
     """Embed 3 randomly sampled articles and print sanity checks."""
     rng = np.random.default_rng(seed)
 
@@ -290,23 +267,17 @@ def test_mode(padding: str = "right", seed: int = None,
     fname = Path(fpath).name
     date_part = fname.split("_")[1]
     file_year, file_month = int(date_part.split("-")[0]), int(date_part.split("-")[1])
-    ckpt_ym = None if last_ckpt else get_checkpoint_ym(file_year, file_month)
+    ckpt_ym = get_checkpoint_ym(file_year, file_month)
 
     print(f"=== TEST MODE ===")
     print(f"File       : {fname}")
-    if last_ckpt:
-        print(f"Checkpoint : (last_ckpt) {ckpt_dir}")
-    else:
-        print(f"Checkpoint : {ckpt_ym[0]}-{ckpt_ym[1]:02d}")
+    print(f"Checkpoint : {ckpt_ym[0]}-{ckpt_ym[1]:02d}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Device     : {device}")
 
     tokenizer = tiktoken.get_encoding("gpt2")
-    model = load_4b_model(
-        *(ckpt_ym if ckpt_ym else (None, None)), device,
-        ckpt_dir=ckpt_dir, last_ckpt=last_ckpt,
-    )
+    model = load_1b_model(*ckpt_ym, device)
 
     with open(fpath, "rb") as f:
         df = pickle.load(f)
@@ -317,8 +288,8 @@ def test_mode(padding: str = "right", seed: int = None,
     token_lens = [len(tokenizer.encode(a)) for a in articles]
     print(f"Articles   : {len(articles)} (indices {list(sorted(indices))},"
           f" token lengths {token_lens}, truncated to {MAX_TOKENS})")
-    print(f"Padding    : {padding}")
 
+    print(f"Padding    : {padding}")
     embs = embed_articles(model, tokenizer, articles, device, padding=padding)
 
     print(f"\nEmbedding shape : {embs.shape}")
@@ -341,35 +312,28 @@ def test_mode(padding: str = "right", seed: int = None,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Embed financial articles with the 4B model.")
+    parser = argparse.ArgumentParser(description="Embed financial articles with the 1B model.")
     parser.add_argument("--test", action="store_true", help="Run sanity check on one file and exit.")
     parser.add_argument("--padding", choices=["left", "right"], default="right",
-                        help="Padding side: 'left' keeps last real token at position -1; "
+                        help="Padding side: 'left' (default) keeps last real token at position -1; "
                              "'right' right-pads and uses each article's true length to index last token.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for article selection in test mode.")
-    parser.add_argument("--last_ckpt", action="store_true",
-                        help="Use the single final checkpoint from 4B-full instead of time-varying checkpoints. "
-                             "Saves results to the 4b-full output directory.")
     args = parser.parse_args()
 
-    ckpt_dir = CKPT_DIR_FULL if args.last_ckpt else CKPT_DIR
-    out_dir_str = OUTPUT_DIR_FULL if args.last_ckpt else OUTPUT_DIR
-
     if args.test:
-        test_mode(padding=args.padding, seed=args.seed, ckpt_dir=ckpt_dir, last_ckpt=args.last_ckpt)
+        test_mode(padding=args.padding, seed=args.seed)
         return
 
-    out_dir = Path(out_dir_str)
+    out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     num_gpus = torch.cuda.device_count()
     print(f"Output dir : {out_dir}")
     print(f"Padding    : {args.padding}")
-    print(f"Last ckpt  : {args.last_ckpt}")
     print(f"Found {num_gpus} GPU(s).")
 
-    work_list = build_work_list(out_dir, last_ckpt=args.last_ckpt)
+    work_list = build_work_list(out_dir)
     print(f"Files remaining: {len(work_list)}")
 
     if not work_list:
@@ -377,12 +341,12 @@ def main():
     elif num_gpus > 1:
         mp.spawn(
             worker,
-            args=(num_gpus, work_list, out_dir, args.padding, ckpt_dir, args.last_ckpt),
+            args=(num_gpus, work_list, out_dir, args.padding),
             nprocs=num_gpus,
             join=True,
         )
     else:
-        worker(0, 1, work_list, out_dir, padding=args.padding, ckpt_dir=ckpt_dir, last_ckpt=args.last_ckpt)
+        worker(0, 1, work_list, out_dir, padding=args.padding)
 
     aggregate_embeddings(out_dir)
     print("\nDone.")

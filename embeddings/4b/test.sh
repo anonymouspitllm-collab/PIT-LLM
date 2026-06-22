@@ -14,7 +14,7 @@ module load python cuda 2>/dev/null || true
 
 VENV=/scratch/$USER/venvs/chronogpt
 
-source "$VENV/bin/activate"
+export PATH="$VENV/bin:$PATH"
 
 SCRIPT_DIR=/home/$USER/repo/embeddings/4b
 cd "$SCRIPT_DIR"

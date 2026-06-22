@@ -1,13 +1,13 @@
 #!/bin/bash -l
-#SBATCH --job-name=4b-embed
+#SBATCH --job-name=1b-embed
 #SBATCH --partition=h100
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=360G
+#SBATCH --mem=160G
 #SBATCH --time=48:00:00
-#SBATCH --output=/home/$USER/repo/embeddings/4b/logs/%j.out
-#SBATCH --error=/home/$USER/repo/embeddings/4b/logs/%j.err
+#SBATCH --output=/home/$USER/repo/embeddings/1b/logs/%j.out
+#SBATCH --error=/home/$USER/repo/embeddings/1b/logs/%j.err
 
 module purge
 module load python cuda 2>/dev/null || true
@@ -15,13 +15,13 @@ module load python cuda 2>/dev/null || true
 VENV=/scratch/$USER/venvs/chronogpt
 export PATH="$VENV/bin:$PATH"
 
-SCRIPT_DIR=/home/$USER/repo/embeddings/4b
+SCRIPT_DIR=/home/$USER/repo/embeddings/1b
 cd "$SCRIPT_DIR"
 export PYTHONPATH="/home/$USER/repo:$PYTHONPATH"
 export PYTHONUNBUFFERED=1
 
-mkdir -p /home/$USER/repo/embeddings/4b/logs
-mkdir -p /scratch/$USER/embeddings/4b-v2
+mkdir -p /home/$USER/repo/embeddings/1b/logs
+mkdir -p /scratch/$USER/embeddings/1b-v2
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"

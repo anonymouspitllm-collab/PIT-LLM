@@ -13,10 +13,10 @@ from utils import load_model
 
 DATASET_DIR = "/scratch/$USER/dataset/jkp_matched"
 OUTPUT_BASE = "/scratch/$USER/embeddings"
-FIRST_MODEL_YEAR = 2012
+FIRST_MODEL_YEAR = 2013
 LAST_MODEL_YEAR = 2024
 MAX_TOKENS = 1792
-BATCH_SIZE = 8
+BATCH_SIZE = 128
 
 
 def get_model_year(file_year: int) -> int:
@@ -33,57 +33,77 @@ def get_model_year(file_year: int) -> int:
     return max(file_year - 1, FIRST_MODEL_YEAR)
 
 
-def embed_articles(model, tokenizer, articles: list[str], device: torch.device) -> np.ndarray:
+def embed_articles(model, tokenizer, articles: list[str], device: torch.device, padding: str = "right") -> np.ndarray:
     """Return last-layer RMS-normed last-token embeddings for each article.
 
-    ChronoGPT's forward() returns (logits, layer_outputs) where layer_outputs[i]
-    is norm(x) after block i — already RMS-normalised, in float32-cast bfloat16.
-    We use layer_outputs[-1] directly instead of a hook on blocks[-1], which
-    would capture the raw (unnormalised) residual stream and produce large,
-    coarsely-quantised values.
+    Captures the input to lm_head via a pre-hook — norm(x) in both base and
+    instruct variants, regardless of what forward() returns.
 
     Args:
         model: ChronoGPT instance.
         tokenizer: tiktoken encoding (gpt2).
         articles: List of raw article strings.
         device: Torch device.
+        padding: "left" (default) pads on the left so the last real token is
+                 always at position -1.  "right" pads on the right and uses
+                 each article's true token length to index the last real token.
 
     Returns:
         numpy array of shape (len(articles), model_dim).
     """
-    # Capture lm_head input via pre-hook: this is norm(x) in both the base
-    # and instruct variants, regardless of what forward() returns.
     captured: dict = {}
 
+    class _EarlyExit(Exception):
+        pass
+
     def _pre_hook(_, args):
-        captured["hidden"] = args[0]
+        captured["hidden"] = args[0].detach()
+        raise _EarlyExit()
 
     handle = model.lm_head.register_forward_pre_hook(_pre_hook)
 
-    embeddings = []
+    # Tokenize all articles upfront and sort by length to minimise padding waste
+    all_token_ids = [tokenizer.encode(text)[:MAX_TOKENS] for text in articles]
+    sorted_indices = np.argsort([len(t) for t in all_token_ids])
+    sorted_token_ids = [all_token_ids[i] for i in sorted_indices]
+
+    sorted_embs = np.empty((len(articles), ), dtype=object)
     try:
-        for i in range(0, len(articles), BATCH_SIZE):
-            batch = articles[i : i + BATCH_SIZE]
+        for i in range(0, len(sorted_token_ids), BATCH_SIZE):
+            batch_ids = sorted_token_ids[i : i + BATCH_SIZE]
 
-            # Tokenize and truncate to first MAX_TOKENS tokens
-            token_ids = [tokenizer.encode(text)[:MAX_TOKENS] for text in batch]
+            max_len = max(len(t) for t in batch_ids)
+            lengths = [len(t) for t in batch_ids]
 
-            # Left-pad so every article's last real token sits at position -1
-            max_len = max(len(t) for t in token_ids)
-            padded = [[0] * (max_len - len(t)) + t for t in token_ids]
+            if padding == "right":
+                padded = [t + [0] * (max_len - len(t)) for t in batch_ids]
+            else:
+                padded = [[0] * (max_len - len(t)) + t for t in batch_ids]
 
             input_ids = torch.tensor(padded, dtype=torch.long).to(device)
 
-            model(input_ids)
+            try:
+                model(input_ids)
+            except _EarlyExit:
+                pass
 
             # captured["hidden"]: (batch, seq_len, model_dim) — RMS-normalised
-            # With left-padding every article's last real token is at position -1
-            batch_emb = captured["hidden"][:, -1, :]
-            embeddings.append(batch_emb.float().cpu().numpy())
+            hidden = captured["hidden"].float().cpu().numpy()
+            if padding == "right":
+                batch_emb = np.stack([hidden[j, lengths[j] - 1, :] for j in range(len(batch_ids))])
+            else:
+                batch_emb = hidden[:, -1, :]
+
+            for j, emb in enumerate(batch_emb):
+                sorted_embs[i + j] = emb
     finally:
         handle.remove()
 
-    return np.vstack(embeddings)
+    # Restore original article order
+    result = np.empty((len(articles), ), dtype=object)
+    for sorted_pos, orig_pos in enumerate(sorted_indices):
+        result[orig_pos] = sorted_embs[sorted_pos]
+    return np.vstack(result)
 
 
 def build_work_list(groups: dict, out_dir: Path) -> list[tuple[int, str]]:
@@ -101,7 +121,7 @@ def build_work_list(groups: dict, out_dir: Path) -> list[tuple[int, str]]:
     return sorted(pairs)
 
 
-def worker(rank: int, num_gpus: int, work_list: list, model_type: str, out_dir: Path) -> None:
+def worker(rank: int, num_gpus: int, work_list: list, model_type: str, out_dir: Path, padding: str = "right") -> None:
     """Embed a contiguous chunk of the work list on GPU `rank`.
 
     The work list is pre-sorted by model_year so each GPU loads at most a
@@ -150,7 +170,7 @@ def worker(rank: int, num_gpus: int, work_list: list, model_type: str, out_dir: 
             articles = df["Article"].fillna("").tolist()
             print(f"  {prefix} Embedding {len(articles):>5} articles from {stem} ...", flush=True)
 
-            embs = embed_articles(model, tokenizer, articles, device)
+            embs = embed_articles(model, tokenizer, articles, device, padding=padding)
             df["embedding"] = list(embs)
 
             with open(out_path, "wb") as f:
@@ -204,7 +224,7 @@ def aggregate_embeddings(out_dir: Path) -> None:
     )
 
     # Step 2: average per (permno, year_month)
-    daily["year_month"] = daily["Date"].astype(str).str[:7].str.replace(r"(\d{4})(\d{2})", r"\1-\2", regex=True)
+    daily["year_month"] = daily["Date"].astype(str).str[:4] + "-" + daily["Date"].astype(str).str[4:6]
     monthly = (
         daily
         .groupby(["permno", "year_month"])["embedding"]
@@ -217,16 +237,16 @@ def aggregate_embeddings(out_dir: Path) -> None:
     print(f"Saved monthly embeddings ({len(monthly)} rows) → {out_path}")
 
 
-def test_mode(model_type: str) -> None:
-    """Embed a single file with 2 articles max and print sanity checks."""
-    import torch.nn.functional as F
+def test_mode(model_type: str, padding: str = "right", seed: int = None) -> None:
+    """Embed 3 randomly sampled articles and print sanity checks."""
+    rng = np.random.default_rng(seed)
 
     all_files = sorted(glob.glob(os.path.join(DATASET_DIR, "DJN_*_retmatched.pkl")))
     if not all_files:
         print("No dataset files found — check DATASET_DIR.")
         return
 
-    fpath = all_files[0]
+    fpath = all_files[rng.integers(len(all_files))]
     fname = Path(fpath).name
     file_year = int(fname.split("_")[1].split("-")[0])
     model_year = get_model_year(file_year)
@@ -245,10 +265,15 @@ def test_mode(model_type: str) -> None:
     with open(fpath, "rb") as f:
         df = pickle.load(f)
 
-    articles = df["Article"].fillna("").tolist()[:3]
-    print(f"Articles   : {len(articles)}")
+    all_articles = df["Article"].fillna("").tolist()
+    indices = rng.choice(len(all_articles), size=min(3, len(all_articles)), replace=False)
+    articles = [all_articles[i] for i in sorted(indices)]
+    token_lens = [len(tokenizer.encode(a)) for a in articles]
+    print(f"Articles   : {len(articles)} (indices {list(sorted(indices))},"
+          f" token lengths {token_lens}, truncated to {MAX_TOKENS})")
+    print(f"Padding    : {padding}")
 
-    embs = embed_articles(model, tokenizer, articles, device)
+    embs = embed_articles(model, tokenizer, articles, device, padding=padding)
 
     print(f"\nEmbedding shape : {embs.shape}")
     print(f"dtype           : {embs.dtype}")
@@ -256,15 +281,15 @@ def test_mode(model_type: str) -> None:
     print(f"mean / std      : {embs.mean():.4f} / {embs.std():.4f}")
     print(f"any NaN         : {np.isnan(embs).any()}")
     print(f"any Inf         : {np.isinf(embs).any()}")
-    print(f"Sample values   : {embs[0, :8]}")
+    for idx in range(len(embs)):
+        print(f"Sample[{idx}]      : {embs[idx, :8]}")
 
-    # Cosine similarity between first two articles (should be < 1 if distinct)
-    if len(embs) >= 2:
-        cos = float(
-            (embs[0] * embs[1]).sum()
-            / (np.linalg.norm(embs[0]) * np.linalg.norm(embs[1]) + 1e-9)
-        )
-        print(f"Cosine sim [0,1]: {cos:.4f}")
+    norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
+    normed = embs / norms
+    for i in range(len(embs)):
+        for j in range(i + 1, len(embs)):
+            cos = float((normed[i] * normed[j]).sum())
+            print(f"Cosine sim [{i},{j}]: {cos:.4f}")
 
     print("\nTest passed.")
 
@@ -279,17 +304,27 @@ def main():
         "--test", action="store_true",
         help="Run a quick sanity check on one file and exit.",
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for article selection in test mode (for reproducibility).",
+    )
+    parser.add_argument(
+        "--padding", choices=["left", "right"], default="right",
+        help="Padding side: 'left' (default) keeps last real token at position -1; "
+             "'right' right-pads and uses each article's true length to index last token.",
+    )
     args = parser.parse_args()
 
     if args.test:
-        test_mode(args.model_type)
+        test_mode(args.model_type, padding=args.padding, seed=args.seed)
         return
 
-    out_dir = Path(OUTPUT_BASE) / f"chronogpt_{args.model_type}"
+    out_dir = Path(OUTPUT_BASE) / f"chronogpt_{args.model_type}-v2"
 
     num_gpus = torch.cuda.device_count()
     print(f"Model type : {args.model_type}")
     print(f"Output dir : {out_dir}")
+    print(f"Padding    : {args.padding}")
     print(f"Found {num_gpus} GPU(s).")
 
     all_files = sorted(glob.glob(os.path.join(DATASET_DIR, "DJN_*_retmatched.pkl")))
@@ -315,12 +350,12 @@ def main():
     elif num_gpus > 1:
         mp.spawn(
             worker,
-            args=(num_gpus, work_list, args.model_type, out_dir),
+            args=(num_gpus, work_list, args.model_type, out_dir, args.padding),
             nprocs=num_gpus,
             join=True,
         )
     else:
-        worker(0, 1, work_list, args.model_type, out_dir)
+        worker(0, 1, work_list, args.model_type, out_dir, padding=args.padding)
 
     aggregate_embeddings(out_dir)
     print("\nDone.")

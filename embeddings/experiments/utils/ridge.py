@@ -66,9 +66,6 @@ class Ridge:
         labels = np.asarray(labels, dtype=float)
 
         t_, p_ = signals.shape
-        self._t = t_
-        self._p = p_
-        self._signals = signals
 
         # Effective shrinkage: optionally scaled by trace(S'S/t) = ||S||²_F / t
         if self.normalize_by_trace:
@@ -76,51 +73,14 @@ class Ridge:
             effective_shrinkage = (p_/t_)*self.shrinkage_list * trace
         else:
             effective_shrinkage = self.shrinkage_list
-        self._effective_shrinkage = effective_shrinkage
 
         if p_ < t_:
-            self.betas, self._eig_vecs, self._eig_vals = self._fit_standard(
-                signals, labels, t_, effective_shrinkage
-            )
-            self._wide = False
+            self.betas = self._fit_standard(signals, labels, t_, effective_shrinkage)
         else:
-            self.betas, self._eig_vecs, self._eig_vals = self._fit_swap(
-                signals, labels, t_, effective_shrinkage
-            )
-            self._wide = True
+            self.betas = self._fit_swap(signals, labels, t_, effective_shrinkage)
 
         self._fitted = True
         return self
-
-    def hat_diagonal(self, signals: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        Return the ridge hat-matrix diagonal h_ii for every z in shrinkage_list.
-
-        Uses the training signals stored during fit() if signals is None.
-
-        Returns
-        -------
-        h : array of shape (t, n_z)
-        """
-        if not self._fitted:
-            raise RuntimeError("Call fit() before hat_diagonal().")
-        X = self._signals if signals is None else np.asarray(signals, dtype=float)
-        t_ = X.shape[0]
-        V, d, z = self._eig_vecs, self._eig_vals, self._effective_shrinkage
-
-        if not self._wide:
-            # standard case: X'X/t = V D V'
-            # h_ii(z_k) = (1/t) * sum_j (V'x_i)_j^2 / (d_j + z_k)
-            xv2 = (X @ V) ** 2                          # (t, p)
-            denom = d[:, None] + z[None, :]             # (p, n_z)
-            h = (xv2 @ (1.0 / denom)) / t_             # (t, n_z)
-        else:
-            # wide case: XX'/t = U D U', H = U D(D+z)^{-1} U'
-            # h_ii(z_k) = sum_j d_j/(d_j+z_k) * U[i,j]^2
-            u2 = V ** 2                                  # (t, t) — V stores U here
-            d_ratio = d[:, None] / (d[:, None] + z[None, :])   # (t, n_z)
-            h = u2 @ d_ratio                            # (t, n_z)
-        return h
 
     # ------------------------------------------------------------------
     # Internal solvers
@@ -132,7 +92,7 @@ class Ridge:
         labels: np.ndarray,
         t_: int,
         shrinkage: np.ndarray,
-    ):
+    ) -> np.ndarray:
         """Decompose the p×p matrix S'S/t (used when p < t)."""
         eigenvalues, eigenvectors = np.linalg.eigh(signals.T @ signals / t_)
         means = signals.T @ labels / t_          # (p,) or (p, k)
@@ -145,8 +105,7 @@ class Ridge:
         else:
             intermed = multiplied[:, :, None] / denom[:, None, :]  # (p, k, n_z)
 
-        betas = eigenvectors @ intermed          # (p, n_z) or (p, k, n_z)
-        return betas, eigenvectors, eigenvalues
+        return eigenvectors @ intermed   # (p, n_z) or (p, k, n_z)
 
     @staticmethod
     def _fit_swap(
@@ -154,7 +113,7 @@ class Ridge:
         labels: np.ndarray,
         t_: int,
         shrinkage: np.ndarray,
-    ):
+    ) -> np.ndarray:
         """Decompose the t×t matrix SS'/t (used when p >= t)."""
         eigenvalues, eigenvectors = np.linalg.eigh(signals @ signals.T / t_)
         means = labels / t_                      # (t,) or (t, k)
@@ -168,8 +127,7 @@ class Ridge:
             intermed = multiplied[:, :, None] / denom[:, None, :]  # (t, k, n_z)
 
         XtU = signals.T @ eigenvectors           # (p, t)
-        betas = XtU @ intermed                   # (p, n_z) or (p, k, n_z)
-        return betas, eigenvectors, eigenvalues
+        return XtU @ intermed                    # (p, n_z) or (p, k, n_z)
 
     # ------------------------------------------------------------------
     # Prediction
