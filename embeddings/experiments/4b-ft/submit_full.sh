@@ -21,7 +21,7 @@ export PYTHONPATH="/home/$USER/repo:$PYTHONPATH"
 export PYTHONUNBUFFERED=1
 
 mkdir -p /home/$USER/repo/embeddings/4b-ft/logs
-mkdir -p /scratch/$USER/embeddings/4b-ft-full
+mkdir -p /scratch/$USER/embeddings/4b-ft-full-v2
 
 echo "Job ID   : $SLURM_JOB_ID"
 echo "Node     : $SLURMD_NODENAME"

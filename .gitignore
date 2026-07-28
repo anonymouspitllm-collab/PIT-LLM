@@ -35,3 +35,6 @@ results/plots/
 *.pkl
 *.npy
 *.npz
+
+# macOS
+.DS_Store
